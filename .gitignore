@@ -1,0 +1,12 @@
+# SQLite database (Railway uses ephemeral storage — no need to commit)
+*.db
+*.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# macOS
+.DS_Store

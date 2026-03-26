@@ -50,6 +50,10 @@ from gemini import (
     save_group_settings,
     get_recent_questions,
     mark_explanation_sent,
+    log_question,
+    get_from_bank,
+    get_bank_count,
+    generate_for_bank,
 )
 from prompts import (
     SUBJECT_TOPIC_MAP,
@@ -82,6 +86,7 @@ if not TELEGRAM_TOKEN:
     )
 
 EXPLANATION_FALLBACK_DELAY = 300  # Seconds before fallback explanation if nobody answers
+BANK_TARGET = 5                   # Keep this many questions pre-generated in the bank
 
 # In-memory store: poll_id → question_data + group_id
 # Used to match a closed poll to its question for explanation posting
@@ -116,6 +121,24 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 # -----------------------------------------------------------------------------
+# QUESTION BANK REPLENISHMENT
+# -----------------------------------------------------------------------------
+
+async def replenish_bank_if_needed():
+    """
+    Check bank size and top it up in a background thread if below BANK_TARGET.
+    Runs after every quiz post so the bank stays stocked for next time.
+    """
+    loop = asyncio.get_event_loop()
+    current = await loop.run_in_executor(None, get_bank_count)
+    needed = BANK_TARGET - current
+    if needed <= 0:
+        return
+    logger.info("Bank has %d questions — generating %d more in background.", current, needed)
+    await loop.run_in_executor(None, generate_for_bank, needed)
+
+
+# -----------------------------------------------------------------------------
 # CORE QUIZ POSTING FUNCTION
 # -----------------------------------------------------------------------------
 
@@ -140,31 +163,37 @@ async def post_quiz(
     # Show typing indicator
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    # Generating message — gives user feedback while Gemini works
-    gen_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=MSG_QUIZ_GENERATING,
-    )
+    # Try to serve instantly from the pre-generated bank
+    settings = get_group_settings(group_id)
+    question_data = get_from_bank(settings["subject"])
 
-    # Generate question
-    question_data = generate_question(group_id)
-
-    # Delete the "generating..." message
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=gen_msg.message_id)
-    except Exception:
-        pass  # Not critical if delete fails
-
-    # Silently skip if generation failed (retry already happened inside gemini.py)
-    if question_data is None:
-        logger.warning("Question generation failed for group %s. Skipping post.", group_id)
-        # Only show error if this was a manual /quiz command, not scheduled
-        # We can't easily distinguish here, so we send a quiet error
-        await context.bot.send_message(
+    if question_data:
+        # Bank hit — log to this group's history and replenish bank in background
+        log_question(group_id, question_data)
+        asyncio.create_task(replenish_bank_if_needed())
+        logger.info("Served from bank for group %s | %s > %s", group_id,
+                    question_data.get("subject"), question_data.get("topic"))
+    else:
+        # Bank empty — generate live (shows "generating..." message)
+        gen_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text=MSG_QUIZ_ERROR,
+            text=MSG_QUIZ_GENERATING,
         )
-        return
+
+        question_data = generate_question(group_id)
+
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=gen_msg.message_id)
+        except Exception:
+            pass
+
+        # Trigger bank replenishment in background regardless of outcome
+        asyncio.create_task(replenish_bank_if_needed())
+
+        if question_data is None:
+            logger.warning("Question generation failed for group %s. Skipping post.", group_id)
+            await context.bot.send_message(chat_id=chat_id, text=MSG_QUIZ_ERROR)
+            return
 
     # Format for Telegram — returns full text message + short poll question
     question_message, poll_question, options, correct_index = format_question_for_telegram(question_data)
@@ -797,6 +826,8 @@ def main():
         await restore_schedules(app)
         # Start the scheduler
         scheduler.start()
+        # Seed the question bank in background so first /quiz is instant
+        asyncio.create_task(replenish_bank_if_needed())
         logger.info("UPSC Samurai is live.")
 
     application.post_init = post_init

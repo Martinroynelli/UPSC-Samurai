@@ -134,6 +134,20 @@ def init_db():
         )
     """)
 
+    # Question bank — pre-generated questions served instantly on /quiz
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS question_bank (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject       TEXT NOT NULL,
+            topic         TEXT NOT NULL,
+            difficulty    TEXT NOT NULL,
+            question_type TEXT NOT NULL,
+            era           TEXT NOT NULL,
+            question_json TEXT NOT NULL,
+            created_at    TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
     logger.info("Database initialised at %s", DB_PATH)
@@ -221,6 +235,24 @@ def get_recent_questions(group_id: str, limit: int = 20) -> list[str]:
     return [row[0][:120] for row in rows]
 
 
+def get_recent_topics(group_id: str, subject: str, limit: int = 5) -> list[str]:
+    """
+    Fetch the most recently used topics for a given subject in a group.
+    Used by select_topic() to avoid repeating the same topic cluster.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT DISTINCT topic FROM question_log "
+        "WHERE group_id = ? AND subject = ? "
+        "ORDER BY generated_at DESC LIMIT ?",
+        (group_id, subject, limit)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
 def log_question(group_id: str, question_data: dict, poll_message_id: str = None):
     """
     Log a successfully generated question to the database.
@@ -297,18 +329,30 @@ def select_subject(group_subject: str) -> str:
     return weighted_choice(SUBJECT_WEIGHTS)
 
 
-def select_topic(subject: str, group_topic: str) -> str:
+def select_topic(subject: str, group_topic: str, group_id: str = None) -> str:
     """
     Pick the topic within the selected subject.
     If admin has set a specific topic, use that.
-    Otherwise pick randomly from the subject's topic list.
+    Otherwise pick randomly, excluding recently used topics to avoid repetition.
+    Excludes up to half the topic list; resets if all topics have been used recently.
     """
     if group_topic != "auto":
         return group_topic
     topics = SUBJECT_TOPIC_MAP.get(subject, [])
     if not topics:
         return "General"
-    return random.choice(topics)
+
+    if group_id:
+        # Exclude topics seen in the last N questions for this subject
+        exclude_limit = max(1, len(topics) // 2)
+        recent = get_recent_topics(group_id, subject, limit=exclude_limit)
+        available = [t for t in topics if t not in recent]
+        if not available:
+            available = topics  # All topics exhausted — full reset
+    else:
+        available = topics
+
+    return random.choice(available)
 
 
 def select_difficulty(group_difficulty: str) -> str:
@@ -492,7 +536,7 @@ def _parse_question_json(raw_text: str) -> Optional[dict]:
 # MAIN PUBLIC FUNCTIONS
 # -----------------------------------------------------------------------------
 
-def generate_question(group_id: str) -> Optional[dict]:
+def generate_question(group_id: str, log_to_db: bool = True) -> Optional[dict]:
     """
     Generate a UPSC Prelims question for a specific Telegram group.
 
@@ -515,7 +559,7 @@ def generate_question(group_id: str) -> Optional[dict]:
 
     # Select parameters
     subject = select_subject(settings["subject"])
-    topic = select_topic(subject, settings["topic"])
+    topic = select_topic(subject, settings["topic"], group_id=group_id)
     difficulty = select_difficulty(settings["difficulty"])
     question_type = select_question_type(settings["era"])
     era_style = determine_era_style(question_type, settings["era"])
@@ -565,8 +609,9 @@ def generate_question(group_id: str) -> Optional[dict]:
     question_data["question_type"] = question_data.get("question_type", question_type)
     question_data["era"] = question_data.get("era", era_style)
 
-    # Log to database
-    log_question(group_id, question_data)
+    # Log to database (skip for bank pre-generation to avoid polluting group history)
+    if log_to_db:
+        log_question(group_id, question_data)
 
     return question_data
 
@@ -607,6 +652,111 @@ def _fallback_explanation(question_data: dict) -> str:
     if concept:
         text += f"\n\nKey concept: {concept}"
     return text
+
+
+# -----------------------------------------------------------------------------
+# QUESTION BANK — pre-generated questions for instant serving
+# -----------------------------------------------------------------------------
+
+def save_to_bank(question_data: dict):
+    """Save a pre-generated question to the bank for later instant serving."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO question_bank
+           (subject, topic, difficulty, question_type, era, question_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            question_data.get("subject", ""),
+            question_data.get("topic", ""),
+            question_data.get("difficulty", ""),
+            question_data.get("question_type", ""),
+            question_data.get("era", ""),
+            json.dumps(question_data),
+            datetime.utcnow().isoformat(),
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_from_bank(subject_filter: str = "auto") -> Optional[dict]:
+    """
+    Pop one question from the bank (oldest first).
+    Filters by subject if group has a specific subject set.
+    Returns None if no matching question is available.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    if subject_filter != "auto":
+        cursor.execute(
+            "SELECT id, question_json FROM question_bank "
+            "WHERE subject = ? ORDER BY created_at ASC LIMIT 1",
+            (subject_filter,)
+        )
+    else:
+        cursor.execute(
+            "SELECT id, question_json FROM question_bank "
+            "ORDER BY created_at ASC LIMIT 1"
+        )
+
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    bank_id, question_json = row
+    cursor.execute("DELETE FROM question_bank WHERE id = ?", (bank_id,))
+    conn.commit()
+    conn.close()
+
+    try:
+        return json.loads(question_json)
+    except json.JSONDecodeError:
+        logger.error("Corrupt question in bank (id=%s), discarding.", bank_id)
+        return None
+
+
+def get_bank_count(subject_filter: str = "auto") -> int:
+    """Return how many questions are currently in the bank."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if subject_filter != "auto":
+        cursor.execute(
+            "SELECT COUNT(*) FROM question_bank WHERE subject = ?",
+            (subject_filter,)
+        )
+    else:
+        cursor.execute("SELECT COUNT(*) FROM question_bank")
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+
+def generate_for_bank(count: int = 3) -> int:
+    """
+    Pre-generate `count` questions and store them in the bank.
+    Called in a background thread so it never blocks the bot.
+    Returns the number of questions successfully generated.
+    """
+    generated = 0
+    for _ in range(count):
+        try:
+            # Use a neutral group_id so topic anti-repetition doesn't interfere
+            question_data = generate_question("__bank__", log_to_db=False)
+            if question_data:
+                save_to_bank(question_data)
+                generated += 1
+                logger.info(
+                    "Banked question: %s > %s",
+                    question_data.get("subject"),
+                    question_data.get("topic"),
+                )
+        except Exception as e:
+            logger.error("Bank pre-generation failed: %s", e)
+    logger.info("Bank replenishment done: %d/%d questions added.", generated, count)
+    return generated
 
 
 def format_question_for_telegram(question_data: dict) -> tuple[str, str, list[str], int]:
